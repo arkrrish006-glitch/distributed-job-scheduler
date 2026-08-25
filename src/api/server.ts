@@ -6,12 +6,23 @@ import rateLimit from 'express-rate-limit';
 import { pool } from '../db';
 import { generateToken, generateSecureApiKey, requireAuth, requireRole, AuthRequest } from './auth';
 import { startCronService } from '../worker/cronScheduler';
+import { logger } from '../logger';
+import {
+  validateBody,
+  registerSchema,
+  loginSchema,
+  createProjectSchema,
+  createQueueSchema,
+  updateQueueSchema,
+  createJobSchema,
+  createBatchJobsSchema,
+  createScheduledJobSchema,
+} from './validation';
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Rate Limiter for Ingestion Routes (Bonus)
 const ingestionLimiter = rateLimit({
   windowMs: 60 * 1000,
   max: 300,
@@ -21,11 +32,8 @@ const ingestionLimiter = rateLimit({
 startCronService(5000);
 
 // --- 1. AUTHENTICATION ROUTES ---
-app.post('/api/auth/register', async (req, res) => {
+app.post('/api/auth/register', validateBody(registerSchema), async (req, res) => {
   const { org_name, email, password } = req.body;
-  if (!email || !password || password.length < 6) {
-    return res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: 'Email and password (min 6 chars) required.' } });
-  }
 
   const client = await pool.connect();
   try {
@@ -42,16 +50,18 @@ app.post('/api/auth/register', async (req, res) => {
 
     const user = userRes.rows[0];
     const token = generateToken(user);
+    logger.info({ userId: user.id, orgId: user.org_id, email: user.email }, 'User and organization registered');
     res.status(201).json({ user, token });
   } catch (err: any) {
     await client.query('ROLLBACK');
+    logger.warn({ email, err: err.message }, 'Registration failed');
     res.status(409).json({ error: { code: 'USER_EXISTS', message: 'User already exists.' } });
   } finally {
     client.release();
   }
 });
 
-app.post('/api/auth/login', async (req, res) => {
+app.post('/api/auth/login', validateBody(loginSchema), async (req, res) => {
   const { email, password } = req.body;
   try {
     const userRes = await pool.query(`SELECT * FROM users WHERE email = $1`, [email.toLowerCase()]);
@@ -65,8 +75,10 @@ app.post('/api/auth/login', async (req, res) => {
     }
 
     const token = generateToken({ id: user.id, org_id: user.org_id, email: user.email, role: user.role });
+    logger.info({ userId: user.id, orgId: user.org_id }, 'User logged in successfully');
     res.json({ token, user: { id: user.id, org_id: user.org_id, email: user.email, role: user.role } });
   } catch (err: any) {
+    logger.error({ err: err.message }, 'Login endpoint failure');
     res.status(500).json({ error: { code: 'SERVER_ERROR', message: err.message } });
   }
 });
@@ -76,17 +88,18 @@ app.get('/api/auth/me', requireAuth, (req: AuthRequest, res: Response) => {
 });
 
 // --- 2. PROJECTS (Org-Scoped) ---
-app.post('/api/projects', requireAuth, async (req: AuthRequest, res: Response) => {
+app.post('/api/projects', requireAuth, validateBody(createProjectSchema), async (req: AuthRequest, res: Response) => {
   const { name } = req.body;
-  if (!name) return res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: 'Project name required.' } });
   try {
     const apiKey = generateSecureApiKey();
     const result = await pool.query(
       `INSERT INTO projects (org_id, name, api_key) VALUES ($1, $2, $3) RETURNING *`,
       [req.user!.org_id, name, apiKey]
     );
+    logger.info({ projectId: result.rows[0].id, orgId: req.user!.org_id }, 'Project created');
     res.status(201).json(result.rows[0]);
   } catch (err: any) {
+    logger.error({ err: err.message, orgId: req.user!.org_id }, 'Project creation error');
     res.status(500).json({ error: { code: 'SERVER_ERROR', message: err.message } });
   }
 });
@@ -96,6 +109,7 @@ app.get('/api/projects', requireAuth, async (req: AuthRequest, res: Response) =>
     const result = await pool.query(`SELECT * FROM projects WHERE org_id = $1 ORDER BY created_at DESC`, [req.user!.org_id]);
     res.json(result.rows);
   } catch (err: any) {
+    logger.error({ err: err.message }, 'Fetch projects error');
     res.status(500).json({ error: { code: 'SERVER_ERROR', message: err.message } });
   }
 });
@@ -127,11 +141,9 @@ app.get('/api/queues', requireAuth, async (req: AuthRequest, res: Response) => {
   }
 });
 
-app.post('/api/queues', requireAuth, async (req: AuthRequest, res: Response) => {
+app.post('/api/queues', requireAuth, validateBody(createQueueSchema), async (req: AuthRequest, res: Response) => {
   const { project_id, name, priority, concurrency_limit, retry_policy_id } = req.body;
-  if (!project_id || !name) return res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: 'project_id and name required.' } });
   
-  // Verify Project belongs to authenticated Org
   const projCheck = await pool.query(`SELECT id FROM projects WHERE id = $1 AND org_id = $2`, [project_id, req.user!.org_id]);
   if (projCheck.rows.length === 0) {
     return res.status(403).json({ error: { code: 'FORBIDDEN', message: 'Unauthorized project access.' } });
@@ -143,13 +155,14 @@ app.post('/api/queues', requireAuth, async (req: AuthRequest, res: Response) => 
        VALUES ($1, $2, $3, $4, $5) RETURNING *`,
       [project_id, name, priority || 1, concurrency_limit || 10, retry_policy_id || null]
     );
+    logger.info({ queueId: result.rows[0].id, name, projectId: project_id }, 'Queue created');
     res.status(201).json(result.rows[0]);
   } catch (err: any) {
     res.status(400).json({ error: { code: 'BAD_REQUEST', message: err.message } });
   }
 });
 
-app.patch('/api/queues/:id', requireAuth, requireRole(['ADMIN']), async (req: AuthRequest, res: Response) => {
+app.patch('/api/queues/:id', requireAuth, requireRole(['ADMIN']), validateBody(updateQueueSchema), async (req: AuthRequest, res: Response) => {
   const { is_paused, concurrency_limit, priority } = req.body;
   try {
     const result = await pool.query(
@@ -163,6 +176,7 @@ app.patch('/api/queues/:id', requireAuth, requireRole(['ADMIN']), async (req: Au
       [is_paused, concurrency_limit, priority, req.params.id, req.user!.org_id]
     );
     if (result.rows.length === 0) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Queue not found in your organization.' } });
+    logger.info({ queueId: req.params.id, isPaused: is_paused, concurrencyLimit: concurrency_limit }, 'Queue configuration updated');
     res.json(result.rows[0]);
   } catch (err: any) {
     res.status(500).json({ error: { code: 'SERVER_ERROR', message: err.message } });
@@ -195,15 +209,10 @@ app.get('/api/queues/:id/stats', requireAuth, async (req: AuthRequest, res: Resp
 });
 
 // --- 4. JOBS (Org-Scoped Ingestion & Listing) ---
-app.post('/api/jobs', requireAuth, ingestionLimiter, async (req: AuthRequest, res: Response) => {
+app.post('/api/jobs', requireAuth, ingestionLimiter, validateBody(createJobSchema), async (req: AuthRequest, res: Response) => {
   const { queue_id, job_type, payload, priority, delay_seconds, max_retries } = req.body;
   const idempotencyKey = req.headers['idempotency-key'] as string;
 
-  if (!queue_id || !payload) {
-    return res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: 'queue_id and payload required.' } });
-  }
-
-  // Tenant Isolation Verification
   const queueCheck = await pool.query(
     `SELECT q.id FROM queues q JOIN projects p ON q.project_id = p.id WHERE q.id = $1 AND p.org_id = $2`,
     [queue_id, req.user!.org_id]
@@ -215,7 +224,10 @@ app.post('/api/jobs', requireAuth, ingestionLimiter, async (req: AuthRequest, re
   try {
     if (idempotencyKey) {
       const existing = await pool.query(`SELECT * FROM jobs WHERE queue_id = $1 AND idempotency_key = $2`, [queue_id, idempotencyKey]);
-      if (existing.rows.length > 0) return res.status(200).json(existing.rows[0]);
+      if (existing.rows.length > 0) {
+        logger.info({ jobId: existing.rows[0].id, idempotencyKey }, 'Returned existing job by idempotency key');
+        return res.status(200).json(existing.rows[0]);
+      }
     }
 
     const scheduledFor = delay_seconds && delay_seconds > 0 ? new Date(Date.now() + delay_seconds * 1000) : new Date();
@@ -228,17 +240,15 @@ app.post('/api/jobs', requireAuth, ingestionLimiter, async (req: AuthRequest, re
       [queue_id, determinedType, payload, priority || 1, scheduledFor, initialStatus, idempotencyKey || null, max_retries || 3]
     );
 
+    logger.info({ jobId: result.rows[0].id, queueId: queue_id, jobType: determinedType }, 'Job enqueued');
     res.status(201).json(result.rows[0]);
   } catch (err: any) {
     res.status(400).json({ error: { code: 'BAD_REQUEST', message: err.message } });
   }
 });
 
-app.post('/api/jobs/batch', requireAuth, ingestionLimiter, async (req: AuthRequest, res: Response) => {
+app.post('/api/jobs/batch', requireAuth, ingestionLimiter, validateBody(createBatchJobsSchema), async (req: AuthRequest, res: Response) => {
   const { queue_id, jobs } = req.body;
-  if (!queue_id || !Array.isArray(jobs) || jobs.length === 0) {
-    return res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: 'queue_id and jobs array required.' } });
-  }
 
   const queueCheck = await pool.query(
     `SELECT q.id FROM queues q JOIN projects p ON q.project_id = p.id WHERE q.id = $1 AND p.org_id = $2`,
@@ -261,6 +271,7 @@ app.post('/api/jobs/batch', requireAuth, ingestionLimiter, async (req: AuthReque
       createdJobs.push(resItem.rows[0]);
     }
     await client.query('COMMIT');
+    logger.info({ count: createdJobs.length, queueId: queue_id }, 'Batch jobs enqueued');
     res.status(201).json({ created_count: createdJobs.length, jobs: createdJobs });
   } catch (err: any) {
     await client.query('ROLLBACK');
@@ -270,11 +281,8 @@ app.post('/api/jobs/batch', requireAuth, ingestionLimiter, async (req: AuthReque
   }
 });
 
-app.post('/api/scheduled-jobs', requireAuth, async (req: AuthRequest, res: Response) => {
+app.post('/api/scheduled-jobs', requireAuth, validateBody(createScheduledJobSchema), async (req: AuthRequest, res: Response) => {
   const { queue_id, name, cron_expression, payload } = req.body;
-  if (!queue_id || !cron_expression || !name) {
-    return res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: 'queue_id, name, and cron_expression required.' } });
-  }
 
   const queueCheck = await pool.query(
     `SELECT q.id FROM queues q JOIN projects p ON q.project_id = p.id WHERE q.id = $1 AND p.org_id = $2`,
@@ -293,6 +301,7 @@ app.post('/api/scheduled-jobs', requireAuth, async (req: AuthRequest, res: Respo
        VALUES ($1, $2, $3, $4, $5) RETURNING *`,
       [queue_id, name, cron_expression, payload || {}, nextRun]
     );
+    logger.info({ scheduledJobId: result.rows[0].id, name, cronExpression: cron_expression }, 'Recurring scheduled cron created');
     res.status(201).json(result.rows[0]);
   } catch (err: any) {
     res.status(400).json({ error: { code: 'INVALID_CRON', message: `Invalid cron: ${err.message}` } });
@@ -351,11 +360,12 @@ app.get('/api/jobs', requireAuth, async (req: AuthRequest, res: Response) => {
       pagination: { page, limit, total, total_pages: Math.ceil(total / limit) }
     });
   } catch (err: any) {
+    logger.error({ err: err.message }, 'Failed to fetch jobs');
     res.status(500).json({ error: { code: 'QUERY_FAILED', message: err.message } });
   }
 });
 
-// --- 5. INFRASTRUCTURE OBSERVABILITY (Global Fleet / Auth Protected) ---
+// --- 5. INFRASTRUCTURE OBSERVABILITY ---
 app.get('/api/workers', requireAuth, async (_req: AuthRequest, res: Response) => {
   try {
     const result = await pool.query(
@@ -397,7 +407,7 @@ app.get('/api/metrics', requireAuth, async (req: AuthRequest, res: Response) => 
   }
 });
 
-// --- 6. DLQ RE-QUEUE RETRY (Org Scoped & Role Restricted) ---
+// --- 6. DLQ RE-QUEUE RETRY ---
 app.post('/api/dlq/:job_id/retry', requireAuth, requireRole(['ADMIN']), async (req: AuthRequest, res: Response) => {
   const client = await pool.connect();
   try {
@@ -420,6 +430,7 @@ app.post('/api/dlq/:job_id/retry', requireAuth, requireRole(['ADMIN']), async (r
       [req.params.job_id]
     );
     await client.query('COMMIT');
+    logger.info({ jobId: req.params.job_id, orgId: req.user!.org_id }, 'DLQ job re-queued');
     res.json({ message: 'Job re-queued successfully', job: jobRes.rows[0] });
   } catch (err: any) {
     await client.query('ROLLBACK');
@@ -429,7 +440,7 @@ app.post('/api/dlq/:job_id/retry', requireAuth, requireRole(['ADMIN']), async (r
   }
 });
 
-// --- 7. EMBEDDED DASHBOARD WITH AUTH TOKEN INPUT ---
+// --- 7. EMBEDDED DASHBOARD ---
 app.get('/', (_req, res) => {
   res.send(`
 <!DOCTYPE html>
@@ -605,8 +616,8 @@ app.get('/', (_req, res) => {
             \`;
           }).join('');
         }
-      } catch (err) {
-        console.warn('Dashboard fetch warning:', err);
+      } catch (err: any) {
+        logger.warn({ err: err.message }, 'Dashboard polling warning');
       }
     }
 
@@ -639,4 +650,4 @@ app.get('/', (_req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 API Server running on http://localhost:${PORT}`));
+app.listen(PORT, () => logger.info({ port: PORT }, `API Server active on http://localhost:${PORT}`));

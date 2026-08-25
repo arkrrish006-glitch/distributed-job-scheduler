@@ -1,6 +1,7 @@
 import { pool } from '../db';
 import { v4 as uuidv4 } from 'uuid';
 import * as os from 'os';
+import { logger } from '../logger';
 
 export const WORKER_ID = uuidv4();
 export const HOSTNAME = os.hostname();
@@ -30,8 +31,8 @@ export async function registerWorker() {
          VALUES ($1, $2, $3, $4)`,
         [WORKER_ID, Math.min(100, Math.round(os.loadavg()[0] * 10)), Math.round((1 - os.freemem() / os.totalmem()) * 100), activeJobCount]
       );
-    } catch (e) {
-      console.error('[Worker] Heartbeat sync failed:', e);
+    } catch (e: any) {
+      logger.error({ err: e.message, workerId: WORKER_ID }, 'Heartbeat sync failed');
     }
   }, 5000);
 
@@ -63,11 +64,11 @@ export async function recoverStaleJobs() {
         );
       }
       if (recovered.rows.length > 0) {
-        console.log(`[Reaper] Safely recovered ${recovered.rows.length} orphaned jobs.`);
+        logger.warn({ recoveredCount: recovered.rows.length, staleWorkerIds: staleIds }, 'Safely recovered orphaned jobs from dead workers');
       }
     }
-  } catch (err) {
-    console.error('[Reaper] Recovery iteration error:', err);
+  } catch (err: any) {
+    logger.error({ err: err.message }, 'Reaper recovery iteration error');
   }
 }
 
@@ -144,6 +145,8 @@ export async function processJob(job: any) {
     );
     await client.query('COMMIT');
 
+    logger.info({ jobId: job.id, workerId: WORKER_ID, attempt: job.retry_count + 1 }, 'Started job execution');
+
     if (job.payload && job.payload.simulate_fail) {
       throw new Error(job.payload.error_reason || 'Simulated execution error');
     }
@@ -167,6 +170,8 @@ export async function processJob(job: any) {
       [job.id, executionId]
     );
     await client.query('COMMIT');
+
+    logger.info({ jobId: job.id, workerId: WORKER_ID, durationMs: executionDuration }, 'Job successfully completed');
   } catch (err: any) {
     await client.query('ROLLBACK');
     const executionDuration = Date.now() - startTime;
@@ -200,6 +205,8 @@ export async function processJob(job: any) {
         [job.id, `Max retries exceeded (${maxRetries}). Sent to DLQ.`]
       );
       await client.query('COMMIT');
+
+      logger.error({ jobId: job.id, workerId: WORKER_ID, totalRetries: nextAttempt, err: err.message }, 'Max retries exhausted; routed job to Dead Letter Queue');
     } else {
       const delay = calculateRetryDelay(policy.strategy, nextAttempt, policy.base_delay_seconds, policy.max_delay_seconds);
       await client.query('BEGIN');
@@ -220,6 +227,8 @@ export async function processJob(job: any) {
         [job.id, `Attempt ${nextAttempt} failed: ${err.message}. Retrying in ${delay}s.`]
       );
       await client.query('COMMIT');
+
+      logger.warn({ jobId: job.id, attempt: nextAttempt, retryDelaySec: delay, strategy: policy.strategy, err: err.message }, 'Job attempt failed; scheduled retry');
     }
   } finally {
     client.release();
@@ -229,7 +238,7 @@ export async function processJob(job: any) {
 
 export async function startWorker() {
   await registerWorker();
-  console.log(`🚀 [Worker Engine] Active: ${WORKER_ID} | Concurrency: ${CONCURRENCY}`);
+  logger.info({ workerId: WORKER_ID, hostname: HOSTNAME, concurrency: CONCURRENCY }, 'Worker engine started and polling');
 
   const activePromises = new Set<Promise<void>>();
 
@@ -245,22 +254,22 @@ export async function startWorker() {
     await new Promise((r) => setTimeout(r, 600));
   }
 
-  console.log(`🛑 [Worker Engine] Draining active jobs...`);
+  logger.warn({ activeJobs: activePromises.size }, 'Draining active jobs before process exit');
   await Promise.all(Array.from(activePromises));
   await pool.query(`UPDATE workers SET status = 'OFFLINE', last_heartbeat = NOW() WHERE id = $1`, [WORKER_ID]);
   if (heartbeatTimer) clearInterval(heartbeatTimer);
   if (reaperTimer) clearInterval(reaperTimer);
-  console.log(`👋 [Worker Engine] Clean shutdown finished.`);
+  logger.info({ workerId: WORKER_ID }, 'Worker engine shut down cleanly');
 }
 
 ['SIGINT', 'SIGTERM'].forEach((signal) => {
   process.on(signal, async () => {
     if (isShuttingDown) return;
-    console.log(`\n⚠️ Received ${signal}. Draining worker gracefully...`);
+    logger.warn({ signal }, 'Termination signal received; starting graceful shutdown sequence');
     isShuttingDown = true;
   });
 });
 
 if (require.main === module) {
-  startWorker().catch(console.error);
+  startWorker().catch((err) => logger.fatal({ err: err.message }, 'Worker crashed'));
 }

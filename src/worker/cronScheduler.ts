@@ -1,5 +1,6 @@
 import { pool } from '../db';
 const cronParser = require('cron-parser');
+import { logger } from '../logger';
 
 export async function runCronSchedulerIteration() {
   const client = await pool.connect();
@@ -28,16 +29,19 @@ export async function runCronSchedulerIteration() {
          WHERE id = $2`,
         [nextDate, item.id]
       );
+
+      logger.info({ scheduledJobId: item.id, name: item.name, nextRunAt: nextDate.toISOString() }, 'Dispatched recurring cron job instance');
     }
     await client.query('COMMIT');
-  } catch (err) {
+  } catch (err: any) {
     await client.query('ROLLBACK');
-    console.error('[Cron Scheduler] Iteration error:', err);
+    logger.error({ err: err.message }, 'Cron scheduler iteration failed');
   } finally {
     client.release();
   }
 }
 
 export function startCronService(intervalMs = 5000) {
+  logger.info({ intervalMs }, 'Recurring cron service active');
   setInterval(runCronSchedulerIteration, intervalMs);
 }
