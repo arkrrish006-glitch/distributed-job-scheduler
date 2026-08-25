@@ -1,12 +1,12 @@
 # ⚡ Distributed Job Scheduler Platform
 
-A production-ready distributed job scheduling and asynchronous execution engine built with **Node.js (TypeScript)** and **PostgreSQL**. Features atomic job claiming, concurrency isolation, heartbeat monitoring, exponential backoff retries, Dead Letter Queue (DLQ) isolation, and a real-time web dashboard.
+A production-grade distributed job scheduling and asynchronous execution engine built with **Node.js (TypeScript)** and **PostgreSQL**. Features atomic job claiming (`FOR UPDATE SKIP LOCKED`), concurrency isolation, worker heartbeats, exponential backoff retries, Dead Letter Queue (DLQ) routing, and a real-time web dashboard.
 
 ---
 
 ## 🏛️ System Architecture
 
-\`\`\`mermaid
+```mermaid
 graph TD
     Client[Web UI / REST API / SDK] -->|1. Enqueue Job| API[Express API Gateway]
     API -->|2. Persist State| Postgres[(PostgreSQL Primary)]
@@ -25,13 +25,13 @@ graph TD
         W1 -->|Max Retries Exceeded| DLQ[(Dead Letter Queue)]
         API -->|Re-queue Job| DLQ
     end
-\`\`\`
+```
 
 ---
 
 ## 📊 Entity Relationship (ER) Diagram
 
-\`\`\`mermaid
+```mermaid
 erDiagram
     ORGANIZATIONS ||--o{ PROJECTS : owns
     PROJECTS ||--o{ QUEUES : contains
@@ -43,28 +43,27 @@ erDiagram
     JOBS ||--o| DEAD_LETTER_QUEUE : routes_to
     WORKERS ||--o{ WORKER_HEARTBEATS : emits
     WORKERS ||--o{ JOB_EXECUTIONS : executes
-\`\`\`
+```
 
 ---
 
 ## ⚙️ Core Technical Features & Design Decisions
 
 ### 1. Atomic Job Claiming Without Race Conditions
-* **Mechanism:** Implements PostgreSQL's row-level locking via \`SELECT ... FOR UPDATE SKIP LOCKED\`.
-* **Trade-off:** Avoids the multi-system sync penalty and cache invalidation risks of using external brokers (e.g., Redis/RabbitMQ) alongside a database, maintaining strict ACID guarantees with zero duplicate processing.
+* **Mechanism:** Uses PostgreSQL's row-level locking via `SELECT ... FOR UPDATE SKIP LOCKED`.
+* **Trade-off:** Eliminates dual-state sync overhead and cache invalidation risks of separate message brokers (e.g. Redis/RabbitMQ), maintaining strict ACID guarantees and zero duplicate claims.
 
 ### 2. Job Lifecycle State Machine
-* \`QUEUED\` ➔ \`CLAIMED\` ➔ \`RUNNING\` ➔ \`COMPLETED\` / \`FAILED\` ➔ \`DEAD_LETTER\`
-* Immediate jobs enter as \`QUEUED\`. Delayed jobs enter as \`SCHEDULED\` with a future timestamp (\`scheduled_for\`).
+* `QUEUED` ➔ `CLAIMED` ➔ `RUNNING` ➔ `COMPLETED` / `FAILED` ➔ `DEAD_LETTER`
+* Immediate jobs enter as `QUEUED`. Delayed jobs enter as `SCHEDULED` with a future `scheduled_for` timestamp.
 
 ### 3. Configurable Retry & Backoff Strategy
-* **Exponential Backoff Formula:** 
-  $$\Delta t = \min(\text{max\_delay}, \text{base\_delay} \times 2^{\text{attempt}})$$
-* Prevents thundering herd problems on downstream services during intermittent outages.
+* **Exponential Backoff Formula:** Delay = min(max_delay, base_delay * 2^attempt)
+* Prevents downstream thundering herd scenarios during intermittent service outages.
 
 ### 4. Fault Detection & Worker Heartbeats
-* Workers send lightweight heartbeats every 5 seconds to the \`workers\` table.
-* Stalled or orphaned jobs from dead workers are safely identified when \`last_heartbeat < NOW() - INTERVAL '30 seconds'\`.
+* Workers update heartbeats every 5 seconds in the `workers` table.
+* Stalled or orphaned jobs from dead workers are safely identified when `last_heartbeat < NOW() - INTERVAL '30 seconds'`.
 
 ---
 
@@ -75,40 +74,40 @@ erDiagram
 * PostgreSQL Database URL (Neon or Local)
 
 ### Installation
-\`\`\`bash
-git clone <your-repo-url>
-cd job-scheduler
+```bash
+git clone https://github.com/arkrrish006-glitch/distributed-job-scheduler.git
+cd distributed-job-scheduler
 npm install
-\`\`\`
+```
 
 ### Environment Configuration
-Create a \`.env\` file in the root directory:
-\`\`\`env
+Create a `.env` file in the root directory:
+```env
 PORT=3000
 DATABASE_URL=postgresql://<user>:<password>@<host>/<database>?sslmode=require
-\`\`\`
+```
 
 ### Database Initialization
-Run \`schema.sql\` in your PostgreSQL query editor.
+Run `schema.sql` in your PostgreSQL query editor.
 
 ### Running the Services
 1. **Start the API Server & Web UI:**
-   \`\`\`bash
+   ```bash
    npx tsx src/api/server.ts
-   \`\`\`
+   ```
 2. **Start the Distributed Worker Node:**
-   \`\`\`bash
+   ```bash
    npx tsx src/worker/worker.ts
-   \`\`\`
-3. **Open Dashboard:** Navigate to \`http://localhost:3000\`
+   ```
+3. **Open Dashboard:** Navigate to `http://localhost:3000`
 
 ---
 
 ## 🧪 Automated Testing
-Run the concurrency and DLQ validation suite:
-\`\`\`bash
-npx tsx src/test.ts
-\`\`\`
+Run the automated concurrency and DLQ validation suite:
+```bash
+npx tsx test.ts
+```
 
 ---
 
@@ -116,10 +115,10 @@ npx tsx src/test.ts
 
 | Method | Endpoint | Description |
 |---|---|---|
-| \`GET\` | \`/api/queues\` | List all active queues |
-| \`POST\` | \`/api/queues\` | Create a new queue |
-| \`GET\` | \`/api/jobs\` | Fetch job history and execution states |
-| \`POST\` | \`/api/jobs\` | Submit an immediate or delayed job |
-| \`GET\` | \`/api/workers\` | Monitor real-time worker health |
-| \`GET\` | \`/api/metrics\` | Aggregated throughput and failure metrics |
-| \`POST\` | \`/api/dlq/:job_id/retry\` | Re-queue a failed DLQ job |
+| `GET` | `/api/queues` | List all active queues |
+| `POST` | `/api/queues` | Create a new queue |
+| `GET` | `/api/jobs` | Fetch job history and execution states |
+| `POST` | `/api/jobs` | Submit an immediate or delayed job |
+| `GET` | `/api/workers` | Monitor real-time worker health |
+| `GET` | `/api/metrics` | Aggregated throughput and failure metrics |
+| `POST` | `/api/dlq/:job_id/retry` | Re-queue a failed DLQ job |
