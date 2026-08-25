@@ -1,19 +1,30 @@
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
 -- Enums
-CREATE TYPE job_status AS ENUM ('QUEUED', 'SCHEDULED', 'CLAIMED', 'RUNNING', 'COMPLETED', 'FAILED', 'DEAD_LETTER');
-CREATE TYPE job_type AS ENUM ('IMMEDIATE', 'DELAYED', 'RECURRING', 'BATCH');
-CREATE TYPE backoff_strategy AS ENUM ('FIXED', 'LINEAR', 'EXPONENTIAL');
-CREATE TYPE worker_status AS ENUM ('ONLINE', 'OFFLINE', 'BUSY');
+DO $$ BEGIN
+    CREATE TYPE job_status AS ENUM ('QUEUED', 'SCHEDULED', 'CLAIMED', 'RUNNING', 'COMPLETED', 'FAILED', 'DEAD_LETTER');
+EXCEPTION WHEN duplicate_object THEN null; END $$;
+
+DO $$ BEGIN
+    CREATE TYPE job_type AS ENUM ('IMMEDIATE', 'DELAYED', 'RECURRING', 'BATCH');
+EXCEPTION WHEN duplicate_object THEN null; END $$;
+
+DO $$ BEGIN
+    CREATE TYPE backoff_strategy AS ENUM ('FIXED', 'LINEAR', 'EXPONENTIAL');
+EXCEPTION WHEN duplicate_object THEN null; END $$;
+
+DO $$ BEGIN
+    CREATE TYPE worker_status AS ENUM ('ONLINE', 'OFFLINE', 'DRAINING');
+EXCEPTION WHEN duplicate_object THEN null; END $$;
 
 -- 1. Organizations & Users
-CREATE TABLE organizations (
+CREATE TABLE IF NOT EXISTS organizations (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     name VARCHAR(255) NOT NULL,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
-CREATE TABLE users (
+CREATE TABLE IF NOT EXISTS users (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     org_id UUID REFERENCES organizations(id) ON DELETE CASCADE,
     email VARCHAR(255) UNIQUE NOT NULL,
@@ -22,8 +33,8 @@ CREATE TABLE users (
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
--- 2. Projects & Queues
-CREATE TABLE projects (
+-- 2. Projects & Retry Policies
+CREATE TABLE IF NOT EXISTS projects (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     org_id UUID REFERENCES organizations(id) ON DELETE CASCADE,
     name VARCHAR(255) NOT NULL,
@@ -31,7 +42,7 @@ CREATE TABLE projects (
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
-CREATE TABLE retry_policies (
+CREATE TABLE IF NOT EXISTS retry_policies (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     name VARCHAR(100) NOT NULL,
     max_retries INT DEFAULT 3,
@@ -40,7 +51,8 @@ CREATE TABLE retry_policies (
     max_delay_seconds INT DEFAULT 300
 );
 
-CREATE TABLE queues (
+-- 3. Queues
+CREATE TABLE IF NOT EXISTS queues (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     project_id UUID REFERENCES projects(id) ON DELETE CASCADE,
     name VARCHAR(100) NOT NULL,
@@ -52,8 +64,8 @@ CREATE TABLE queues (
     UNIQUE(project_id, name)
 );
 
--- 3. Workers & Heartbeats
-CREATE TABLE workers (
+-- 4. Workers & Heartbeats
+CREATE TABLE IF NOT EXISTS workers (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     hostname VARCHAR(255) NOT NULL,
     pid INT NOT NULL,
@@ -64,17 +76,17 @@ CREATE TABLE workers (
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
-CREATE TABLE worker_heartbeats (
+CREATE TABLE IF NOT EXISTS worker_heartbeats (
     id BIGSERIAL PRIMARY KEY,
     worker_id UUID REFERENCES workers(id) ON DELETE CASCADE,
-    cpu_usage NUMERIC(5,2),
-    memory_usage NUMERIC(5,2),
-    active_jobs INT,
+    cpu_usage NUMERIC(5,2) DEFAULT 0.00,
+    memory_usage NUMERIC(5,2) DEFAULT 0.00,
+    active_jobs INT DEFAULT 0,
     recorded_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
--- 4. Jobs & Scheduled Jobs
-CREATE TABLE jobs (
+-- 5. Jobs & Scheduled Jobs
+CREATE TABLE IF NOT EXISTS jobs (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     queue_id UUID REFERENCES queues(id) ON DELETE CASCADE,
     job_type job_type DEFAULT 'IMMEDIATE',
@@ -82,6 +94,7 @@ CREATE TABLE jobs (
     priority INT DEFAULT 1,
     payload JSONB NOT NULL,
     result JSONB,
+    idempotency_key VARCHAR(255),
     max_retries INT DEFAULT 3,
     retry_count INT DEFAULT 0,
     scheduled_for TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
@@ -90,7 +103,7 @@ CREATE TABLE jobs (
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
-CREATE TABLE scheduled_jobs (
+CREATE TABLE IF NOT EXISTS scheduled_jobs (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     queue_id UUID REFERENCES queues(id) ON DELETE CASCADE,
     name VARCHAR(255) NOT NULL,
@@ -102,8 +115,8 @@ CREATE TABLE scheduled_jobs (
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
--- 5. Executions, Logs, DLQ
-CREATE TABLE job_executions (
+-- 6. Executions, Logs, DLQ
+CREATE TABLE IF NOT EXISTS job_executions (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     job_id UUID REFERENCES jobs(id) ON DELETE CASCADE,
     worker_id UUID REFERENCES workers(id) ON DELETE SET NULL,
@@ -115,7 +128,7 @@ CREATE TABLE job_executions (
     execution_time_ms INT
 );
 
-CREATE TABLE job_logs (
+CREATE TABLE IF NOT EXISTS job_logs (
     id BIGSERIAL PRIMARY KEY,
     job_id UUID REFERENCES jobs(id) ON DELETE CASCADE,
     execution_id UUID REFERENCES job_executions(id) ON DELETE CASCADE,
@@ -124,7 +137,7 @@ CREATE TABLE job_logs (
     logged_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
-CREATE TABLE dead_letter_queue (
+CREATE TABLE IF NOT EXISTS dead_letter_queue (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     job_id UUID REFERENCES jobs(id) ON DELETE CASCADE,
     queue_id UUID REFERENCES queues(id) ON DELETE CASCADE,
@@ -134,8 +147,9 @@ CREATE TABLE dead_letter_queue (
     original_payload JSONB
 );
 
--- CRITICAL INDEXES for Concurrency & Speed
-CREATE INDEX idx_jobs_claim ON jobs (status, scheduled_for, priority DESC, created_at ASC)
-    WHERE status IN ('QUEUED', 'SCHEDULED');
-CREATE INDEX idx_jobs_queue_status ON jobs (queue_id, status);
-CREATE INDEX idx_worker_heartbeat ON workers (last_heartbeat, status);
+-- Critical Indexes for Atomic Claiming, Queue Concurrency & Idempotency
+CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_idempotency ON jobs (queue_id, idempotency_key) WHERE idempotency_key IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_jobs_claim_covering ON jobs (status, scheduled_for, priority DESC, created_at ASC) WHERE status IN ('QUEUED', 'SCHEDULED');
+CREATE INDEX IF NOT EXISTS idx_jobs_queue_active ON jobs (queue_id) WHERE status IN ('CLAIMED', 'RUNNING');
+CREATE INDEX IF NOT EXISTS idx_worker_heartbeat_status ON workers (last_heartbeat, status);
+CREATE INDEX IF NOT EXISTS idx_scheduled_jobs_due ON scheduled_jobs (is_active, next_run_at) WHERE is_active = TRUE;
