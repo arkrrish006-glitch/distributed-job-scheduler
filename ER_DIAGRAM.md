@@ -1,5 +1,3 @@
-#### 2. `ER_DIAGRAM.md`
-```markdown
 # 📊 Database Entity Relationship & Indexing Model
 
 ```mermaid
