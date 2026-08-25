@@ -26,4 +26,9 @@ graph TD
         Cron[Cron Parser Daemon] -->|next_run_at <= NOW| DB
         Cron -->|Dispatches RECURRING job instance| DB
     end
-    '''
+```
+
+### Key Architectural Concepts
+1. **Source of Truth:** PostgreSQL acts as both the transactional store and the coordination engine via row-level locks.
+2. **Crash Recovery Reaper:** Stale worker heartbeats are continuously audited to guarantee zero orphaned jobs.
+3. **Queue Concurrency Control:** Worker polling queries enforce queue limits dynamically via atomic Common Table Expressions (CTEs).
