@@ -145,7 +145,7 @@ export async function processJob(job: any) {
     await client.query('COMMIT');
 
     if (job.payload && job.payload.simulate_fail) {
-      throw new Error(job.payload.error_reason || 'Simulated runtime exception');
+      throw new Error(job.payload.error_reason || 'Simulated execution error');
     }
     await new Promise((resolve) => setTimeout(resolve, 500));
 
@@ -197,7 +197,7 @@ export async function processJob(job: any) {
       await client.query(
         `INSERT INTO job_logs (job_id, level, message)
          VALUES ($1, 'ERROR', $2)`,
-        [job.id, `Max retries reached (${maxRetries}). Moved to DLQ.`]
+        [job.id, `Max retries exceeded (${maxRetries}). Sent to DLQ.`]
       );
       await client.query('COMMIT');
     } else {
@@ -217,7 +217,7 @@ export async function processJob(job: any) {
       await client.query(
         `INSERT INTO job_logs (job_id, level, message)
          VALUES ($1, 'WARN', $2)`,
-        [job.id, `Attempt ${nextAttempt} failed: ${err.message}. Retrying in ${delay}s (${policy.strategy}).`]
+        [job.id, `Attempt ${nextAttempt} failed: ${err.message}. Retrying in ${delay}s.`]
       );
       await client.query('COMMIT');
     }
@@ -245,12 +245,12 @@ export async function startWorker() {
     await new Promise((r) => setTimeout(r, 600));
   }
 
-  console.log(`🛑 [Worker Engine] Draining ${activePromises.size} active jobs...`);
+  console.log(`🛑 [Worker Engine] Draining active jobs...`);
   await Promise.all(Array.from(activePromises));
   await pool.query(`UPDATE workers SET status = 'OFFLINE', last_heartbeat = NOW() WHERE id = $1`, [WORKER_ID]);
   if (heartbeatTimer) clearInterval(heartbeatTimer);
   if (reaperTimer) clearInterval(reaperTimer);
-  console.log(`👋 [Worker Engine] Clean shutdown complete.`);
+  console.log(`👋 [Worker Engine] Clean shutdown finished.`);
 }
 
 ['SIGINT', 'SIGTERM'].forEach((signal) => {

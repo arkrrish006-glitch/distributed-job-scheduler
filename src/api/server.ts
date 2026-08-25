@@ -1,18 +1,26 @@
 import express, { Response } from 'express';
 import cors from 'cors';
-const bcrypt = require('bcryptjs');
+import * as bcrypt from 'bcryptjs';
 const cronParser = require('cron-parser');
+import rateLimit from 'express-rate-limit';
 import { pool } from '../db';
-import { generateToken, requireAuth, AuthRequest } from './auth';
+import { generateToken, generateSecureApiKey, requireAuth, requireRole, AuthRequest } from './auth';
 import { startCronService } from '../worker/cronScheduler';
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
+// Rate Limiter for Ingestion Routes (Bonus)
+const ingestionLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 300,
+  message: { error: { code: 'RATE_LIMIT_EXCEEDED', message: 'Too many requests. Please try again later.' } }
+});
+
 startCronService(5000);
 
-// --- AUTHENTICATION ---
+// --- 1. AUTHENTICATION ROUTES ---
 app.post('/api/auth/register', async (req, res) => {
   const { org_name, email, password } = req.body;
   if (!email || !password || password.length < 6) {
@@ -67,12 +75,12 @@ app.get('/api/auth/me', requireAuth, (req: AuthRequest, res: Response) => {
   res.json({ user: req.user });
 });
 
-// --- PROJECTS ---
+// --- 2. PROJECTS (Org-Scoped) ---
 app.post('/api/projects', requireAuth, async (req: AuthRequest, res: Response) => {
   const { name } = req.body;
   if (!name) return res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: 'Project name required.' } });
   try {
-    const apiKey = `pk_live_${Buffer.from(Math.random().toString()).toString('base64').substring(0, 16)}`;
+    const apiKey = generateSecureApiKey();
     const result = await pool.query(
       `INSERT INTO projects (org_id, name, api_key) VALUES ($1, $2, $3) RETURNING *`,
       [req.user!.org_id, name, apiKey]
@@ -92,19 +100,43 @@ app.get('/api/projects', requireAuth, async (req: AuthRequest, res: Response) =>
   }
 });
 
-// --- QUEUES ---
-app.get('/api/queues', async (_req, res) => {
+app.get('/api/projects/:id', requireAuth, async (req: AuthRequest, res: Response) => {
   try {
-    const result = await pool.query(`SELECT q.*, rp.name as retry_policy_name FROM queues q LEFT JOIN retry_policies rp ON q.retry_policy_id = rp.id ORDER BY q.created_at DESC`);
+    const result = await pool.query(`SELECT * FROM projects WHERE id = $1 AND org_id = $2`, [req.params.id, req.user!.org_id]);
+    if (result.rows.length === 0) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Project not found.' } });
+    res.json(result.rows[0]);
+  } catch (err: any) {
+    res.status(500).json({ error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// --- 3. QUEUES (Org-Scoped) ---
+app.get('/api/queues', requireAuth, async (req: AuthRequest, res: Response) => {
+  try {
+    const result = await pool.query(
+      `SELECT q.*, p.name as project_name, rp.name as retry_policy_name 
+       FROM queues q 
+       JOIN projects p ON q.project_id = p.id 
+       LEFT JOIN retry_policies rp ON q.retry_policy_id = rp.id 
+       WHERE p.org_id = $1 ORDER BY q.created_at DESC`,
+      [req.user!.org_id]
+    );
     res.json(result.rows);
   } catch (err: any) {
     res.status(500).json({ error: { code: 'SERVER_ERROR', message: err.message } });
   }
 });
 
-app.post('/api/queues', async (req, res) => {
+app.post('/api/queues', requireAuth, async (req: AuthRequest, res: Response) => {
   const { project_id, name, priority, concurrency_limit, retry_policy_id } = req.body;
   if (!project_id || !name) return res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: 'project_id and name required.' } });
+  
+  // Verify Project belongs to authenticated Org
+  const projCheck = await pool.query(`SELECT id FROM projects WHERE id = $1 AND org_id = $2`, [project_id, req.user!.org_id]);
+  if (projCheck.rows.length === 0) {
+    return res.status(403).json({ error: { code: 'FORBIDDEN', message: 'Unauthorized project access.' } });
+  }
+
   try {
     const result = await pool.query(
       `INSERT INTO queues (project_id, name, priority, concurrency_limit, retry_policy_id)
@@ -117,45 +149,67 @@ app.post('/api/queues', async (req, res) => {
   }
 });
 
-app.patch('/api/queues/:id', async (req, res) => {
+app.patch('/api/queues/:id', requireAuth, requireRole(['ADMIN']), async (req: AuthRequest, res: Response) => {
   const { is_paused, concurrency_limit, priority } = req.body;
   try {
     const result = await pool.query(
-      `UPDATE queues
-       SET is_paused = COALESCE($1, is_paused),
-           concurrency_limit = COALESCE($2, concurrency_limit),
-           priority = COALESCE($3, priority)
-       WHERE id = $4 RETURNING *`,
-      [is_paused, concurrency_limit, priority, req.params.id]
+      `UPDATE queues q
+       SET is_paused = COALESCE($1, q.is_paused),
+           concurrency_limit = COALESCE($2, q.concurrency_limit),
+           priority = COALESCE($3, q.priority)
+       FROM projects p
+       WHERE q.id = $4 AND q.project_id = p.id AND p.org_id = $5
+       RETURNING q.*`,
+      [is_paused, concurrency_limit, priority, req.params.id, req.user!.org_id]
     );
-    if (result.rows.length === 0) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Queue not found.' } });
+    if (result.rows.length === 0) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Queue not found in your organization.' } });
     res.json(result.rows[0]);
   } catch (err: any) {
     res.status(500).json({ error: { code: 'SERVER_ERROR', message: err.message } });
   }
 });
 
-app.get('/api/queues/:id/stats', async (req, res) => {
+app.get('/api/queues/:id/stats', requireAuth, async (req: AuthRequest, res: Response) => {
   try {
     const stats = await pool.query(
-      `SELECT status, COUNT(*)::int as count 
-       FROM jobs WHERE queue_id = $1 GROUP BY status`,
-      [req.params.id]
+      `SELECT j.status, COUNT(*)::int as count 
+       FROM jobs j
+       JOIN queues q ON j.queue_id = q.id
+       JOIN projects p ON q.project_id = p.id
+       WHERE q.id = $1 AND p.org_id = $2
+       GROUP BY j.status`,
+      [req.params.id, req.user!.org_id]
     );
-    const dlq = await pool.query(`SELECT COUNT(*)::int as dlq_count FROM dead_letter_queue WHERE queue_id = $1`, [req.params.id]);
+    const dlq = await pool.query(
+      `SELECT COUNT(*)::int as dlq_count 
+       FROM dead_letter_queue dlq
+       JOIN queues q ON dlq.queue_id = q.id
+       JOIN projects p ON q.project_id = p.id
+       WHERE dlq.queue_id = $1 AND p.org_id = $2`,
+      [req.params.id, req.user!.org_id]
+    );
     res.json({ queue_id: req.params.id, stats: stats.rows, dlq: dlq.rows[0]?.dlq_count || 0 });
   } catch (err: any) {
     res.status(500).json({ error: { code: 'SERVER_ERROR', message: err.message } });
   }
 });
 
-// --- JOBS (IMMEDIATE, DELAYED, BATCH, IDEMPOTENT) ---
-app.post('/api/jobs', async (req, res) => {
+// --- 4. JOBS (Org-Scoped Ingestion & Listing) ---
+app.post('/api/jobs', requireAuth, ingestionLimiter, async (req: AuthRequest, res: Response) => {
   const { queue_id, job_type, payload, priority, delay_seconds, max_retries } = req.body;
   const idempotencyKey = req.headers['idempotency-key'] as string;
 
   if (!queue_id || !payload) {
     return res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: 'queue_id and payload required.' } });
+  }
+
+  // Tenant Isolation Verification
+  const queueCheck = await pool.query(
+    `SELECT q.id FROM queues q JOIN projects p ON q.project_id = p.id WHERE q.id = $1 AND p.org_id = $2`,
+    [queue_id, req.user!.org_id]
+  );
+  if (queueCheck.rows.length === 0) {
+    return res.status(403).json({ error: { code: 'FORBIDDEN', message: 'Queue does not belong to your organization.' } });
   }
 
   try {
@@ -180,10 +234,18 @@ app.post('/api/jobs', async (req, res) => {
   }
 });
 
-app.post('/api/jobs/batch', async (req, res) => {
+app.post('/api/jobs/batch', requireAuth, ingestionLimiter, async (req: AuthRequest, res: Response) => {
   const { queue_id, jobs } = req.body;
   if (!queue_id || !Array.isArray(jobs) || jobs.length === 0) {
     return res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: 'queue_id and jobs array required.' } });
+  }
+
+  const queueCheck = await pool.query(
+    `SELECT q.id FROM queues q JOIN projects p ON q.project_id = p.id WHERE q.id = $1 AND p.org_id = $2`,
+    [queue_id, req.user!.org_id]
+  );
+  if (queueCheck.rows.length === 0) {
+    return res.status(403).json({ error: { code: 'FORBIDDEN', message: 'Unauthorized queue access.' } });
   }
 
   const client = await pool.connect();
@@ -208,11 +270,18 @@ app.post('/api/jobs/batch', async (req, res) => {
   }
 });
 
-// --- SCHEDULED RECURRING CRON ---
-app.post('/api/scheduled-jobs', async (req, res) => {
+app.post('/api/scheduled-jobs', requireAuth, async (req: AuthRequest, res: Response) => {
   const { queue_id, name, cron_expression, payload } = req.body;
   if (!queue_id || !cron_expression || !name) {
     return res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: 'queue_id, name, and cron_expression required.' } });
+  }
+
+  const queueCheck = await pool.query(
+    `SELECT q.id FROM queues q JOIN projects p ON q.project_id = p.id WHERE q.id = $1 AND p.org_id = $2`,
+    [queue_id, req.user!.org_id]
+  );
+  if (queueCheck.rows.length === 0) {
+    return res.status(403).json({ error: { code: 'FORBIDDEN', message: 'Unauthorized queue access.' } });
   }
 
   try {
@@ -226,19 +295,18 @@ app.post('/api/scheduled-jobs', async (req, res) => {
     );
     res.status(201).json(result.rows[0]);
   } catch (err: any) {
-    res.status(400).json({ error: { code: 'INVALID_CRON', message: `Invalid cron format: ${err.message}` } });
+    res.status(400).json({ error: { code: 'INVALID_CRON', message: `Invalid cron: ${err.message}` } });
   }
 });
 
-// --- PAGINATION & FILTERING ---
-app.get('/api/jobs', async (req, res) => {
+app.get('/api/jobs', requireAuth, async (req: AuthRequest, res: Response) => {
   const page = parseInt(req.query.page as string) || 1;
   const limit = Math.min(100, parseInt(req.query.limit as string) || 20);
   const offset = (page - 1) * limit;
 
   const { status, queue_id, job_type } = req.query;
-  const conditions: string[] = [];
-  const params: any[] = [];
+  const conditions: string[] = ['p.org_id = $1'];
+  const params: any[] = [req.user!.org_id];
 
   if (status) {
     params.push(status);
@@ -253,16 +321,24 @@ app.get('/api/jobs', async (req, res) => {
     conditions.push(`j.job_type = $${params.length}`);
   }
 
-  const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+  const whereClause = `WHERE ${conditions.join(' AND ')}`;
 
   try {
-    const countRes = await pool.query(`SELECT COUNT(*)::int as total FROM jobs j ${whereClause}`, params);
+    const countRes = await pool.query(
+      `SELECT COUNT(*)::int as total 
+       FROM jobs j 
+       JOIN queues q ON j.queue_id = q.id 
+       JOIN projects p ON q.project_id = p.id 
+       ${whereClause}`,
+      params
+    );
     const total = countRes.rows[0].total;
 
     const dataRes = await pool.query(
       `SELECT j.*, q.name as queue_name, w.hostname as worker_hostname
        FROM jobs j
-       LEFT JOIN queues q ON j.queue_id = q.id
+       JOIN queues q ON j.queue_id = q.id
+       JOIN projects p ON q.project_id = p.id
        LEFT JOIN workers w ON j.claimed_by = w.id
        ${whereClause}
        ORDER BY j.created_at DESC
@@ -279,7 +355,8 @@ app.get('/api/jobs', async (req, res) => {
   }
 });
 
-app.get('/api/workers', async (_req, res) => {
+// --- 5. INFRASTRUCTURE OBSERVABILITY (Global Fleet / Auth Protected) ---
+app.get('/api/workers', requireAuth, async (_req: AuthRequest, res: Response) => {
   try {
     const result = await pool.query(
       `SELECT *,
@@ -295,10 +372,22 @@ app.get('/api/workers', async (_req, res) => {
   }
 });
 
-app.get('/api/metrics', async (_req, res) => {
+app.get('/api/metrics', requireAuth, async (req: AuthRequest, res: Response) => {
   try {
-    const jobStats = await pool.query(`SELECT status, COUNT(*)::int as count FROM jobs GROUP BY status`);
-    const workerStats = await pool.query(`SELECT COUNT(*)::int as active_workers FROM workers WHERE last_heartbeat > NOW() - INTERVAL '15 seconds' AND status = 'ONLINE'`);
+    const jobStats = await pool.query(
+      `SELECT j.status, COUNT(*)::int as count 
+       FROM jobs j
+       JOIN queues q ON j.queue_id = q.id
+       JOIN projects p ON q.project_id = p.id
+       WHERE p.org_id = $1
+       GROUP BY j.status`,
+      [req.user!.org_id]
+    );
+    const workerStats = await pool.query(
+      `SELECT COUNT(*)::int as active_workers 
+       FROM workers 
+       WHERE last_heartbeat > NOW() - INTERVAL '15 seconds' AND status = 'ONLINE'`
+    );
     res.json({
       jobs: jobStats.rows,
       active_workers: workerStats.rows[0]?.active_workers || 0
@@ -308,23 +397,26 @@ app.get('/api/metrics', async (_req, res) => {
   }
 });
 
-// --- DLQ RE-QUEUE RETRY ---
-app.post('/api/dlq/:job_id/retry', async (req, res) => {
+// --- 6. DLQ RE-QUEUE RETRY (Org Scoped & Role Restricted) ---
+app.post('/api/dlq/:job_id/retry', requireAuth, requireRole(['ADMIN']), async (req: AuthRequest, res: Response) => {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
     const jobRes = await client.query(
-      `UPDATE jobs SET status = 'QUEUED', retry_count = 0, scheduled_for = NOW(), updated_at = NOW()
-       WHERE id = $1 RETURNING *`,
-      [req.params.job_id]
+      `UPDATE jobs j
+       SET status = 'QUEUED', retry_count = 0, scheduled_for = NOW(), updated_at = NOW()
+       FROM queues q, projects p
+       WHERE j.id = $1 AND j.queue_id = q.id AND q.project_id = p.id AND p.org_id = $2
+       RETURNING j.*`,
+      [req.params.job_id, req.user!.org_id]
     );
     if (jobRes.rows.length === 0) {
       await client.query('ROLLBACK');
-      return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Job not found.' } });
+      return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Job not found in your organization.' } });
     }
     await client.query(`DELETE FROM dead_letter_queue WHERE job_id = $1`, [req.params.job_id]);
     await client.query(
-      `INSERT INTO job_logs (job_id, level, message) VALUES ($1, 'INFO', 'Job re-queued manually from DLQ')`,
+      `INSERT INTO job_logs (job_id, level, message) VALUES ($1, 'INFO', 'Job manually re-queued from DLQ')`,
       [req.params.job_id]
     );
     await client.query('COMMIT');
@@ -337,7 +429,7 @@ app.post('/api/dlq/:job_id/retry', async (req, res) => {
   }
 });
 
-// --- EMBEDDED REAL-TIME WEB DASHBOARD ---
+// --- 7. EMBEDDED DASHBOARD WITH AUTH TOKEN INPUT ---
 app.get('/', (_req, res) => {
   res.send(`
 <!DOCTYPE html>
@@ -354,10 +446,14 @@ app.get('/', (_req, res) => {
         <h1 class="text-2xl font-bold tracking-tight text-white flex items-center gap-2">
           ⚡ Distributed Job Scheduler
         </h1>
-        <p class="text-xs text-slate-400">PostgreSQL SKIP LOCKED Concurrency & Multi-Worker Engine</p>
+        <p class="text-xs text-slate-400">PostgreSQL SKIP LOCKED Concurrency & Multi-Worker Fleet</p>
       </div>
-      <div class="flex items-center gap-2 bg-emerald-950/80 border border-emerald-700/60 px-3 py-1 rounded-full text-emerald-300 text-xs font-semibold">
-        <span class="w-2 h-2 rounded-full bg-emerald-400 animate-ping"></span> Live Polling (2s)
+      <div class="flex items-center gap-3">
+        <input id="authToken" type="password" placeholder="Paste Bearer Token or x-api-key" class="bg-slate-900 border border-slate-700 rounded px-3 py-1 text-xs text-slate-200 focus:outline-none focus:border-indigo-500 w-64" />
+        <button onclick="loadData()" class="bg-indigo-600 hover:bg-indigo-500 text-white px-3 py-1 rounded text-xs">Authorize</button>
+        <div class="flex items-center gap-2 bg-emerald-950/80 border border-emerald-700/60 px-3 py-1 rounded-full text-emerald-300 text-xs font-semibold">
+          <span class="w-2 h-2 rounded-full bg-emerald-400 animate-ping"></span> Live (2s)
+        </div>
       </div>
     </div>
 
@@ -399,7 +495,7 @@ app.get('/', (_req, res) => {
     <!-- Job Explorer -->
     <div class="bg-slate-900 p-5 rounded border border-slate-800 space-y-3">
       <div class="flex justify-between items-center">
-        <h2 class="text-sm font-semibold text-white">Job Explorer & Execution Records</h2>
+        <h2 class="text-sm font-semibold text-white">Job Explorer & Execution History</h2>
         <div class="flex gap-2">
           <select id="filterStatus" onchange="loadData()" class="bg-slate-950 border border-slate-700 rounded px-2 py-1 text-xs">
             <option value="">All Statuses</option>
@@ -424,72 +520,94 @@ app.get('/', (_req, res) => {
   </div>
 
   <script>
+    function getHeaders() {
+      const token = document.getElementById('authToken').value.trim();
+      const h = { 'Content-Type': 'application/json' };
+      if (token) {
+        if (token.startsWith('pk_live_')) h['x-api-key'] = token;
+        else h['Authorization'] = 'Bearer ' + token;
+      }
+      return h;
+    }
+
     async function loadData() {
+      const h = getHeaders();
       const statusFilter = document.getElementById('filterStatus').value;
       const statusQuery = statusFilter ? '&status=' + statusFilter : '';
-      const [metricsRes, queuesRes, workersRes, jobsRes] = await Promise.all([
-        fetch('/api/metrics').then(r => r.json()),
-        fetch('/api/queues').then(r => r.json()),
-        fetch('/api/workers').then(r => r.json()),
-        fetch('/api/jobs?limit=25' + statusQuery).then(r => r.json())
-      ]);
+      try {
+        const [metricsRes, queuesRes, workersRes, jobsRes] = await Promise.all([
+          fetch('/api/metrics', { headers: h }).then(r => r.json()),
+          fetch('/api/queues', { headers: h }).then(r => r.json()),
+          fetch('/api/workers', { headers: h }).then(r => r.json()),
+          fetch('/api/jobs?limit=25' + statusQuery, { headers: h }).then(r => r.json())
+        ]);
 
-      document.getElementById('statWorkers').innerText = metricsRes.active_workers;
-      let c = 0, q = 0, r = 0, d = 0;
-      metricsRes.jobs.forEach(item => {
-        if (item.status === 'COMPLETED') c += item.count;
-        if (['QUEUED', 'SCHEDULED'].includes(item.status)) q += item.count;
-        if (['CLAIMED', 'RUNNING'].includes(item.status)) r += item.count;
-        if (item.status === 'DEAD_LETTER') d += item.count;
-      });
-      document.getElementById('statCompleted').innerText = c;
-      document.getElementById('statQueued').innerText = q;
-      document.getElementById('statRunning').innerText = r;
-      document.getElementById('statDLQ').innerText = d;
-
-      const qSel = document.getElementById('queueSelect');
-      if (qSel.children.length === 0) {
-        queuesRes.forEach(queue => {
-          const opt = document.createElement('option');
-          opt.value = queue.id;
-          opt.innerText = queue.name + ' (Max ' + queue.concurrency_limit + ')';
-          qSel.appendChild(opt);
-        });
-      }
-
-      document.getElementById('workersTable').innerHTML = workersRes.map(w => \`
-        <tr>
-          <td class="p-2 text-indigo-400">\${w.id.slice(0,8)}...</td>
-          <td class="p-2 text-slate-400 font-sans">\${w.hostname}</td>
-          <td class="p-2">\${w.pid}</td>
-          <td class="p-2">\${w.current_load}/\${w.concurrency}</td>
-          <td class="p-2"><span class="px-2 py-0.5 rounded text-[10px] font-bold \${w.live_status === 'ONLINE' ? 'bg-emerald-950 text-emerald-300 border border-emerald-700' : 'bg-rose-950 text-rose-300 border border-rose-700'}">\${w.live_status}</span></td>
-        </tr>
-      \`).join('');
-
-      document.getElementById('jobsTable').innerHTML = (jobsRes.data || []).map(j => {
-        let badge = 'bg-slate-800 text-slate-300';
-        if (j.status === 'COMPLETED') badge = 'bg-emerald-950 text-emerald-300 border border-emerald-700';
-        if (['RUNNING', 'CLAIMED'].includes(j.status)) badge = 'bg-amber-950 text-amber-300 border border-amber-700';
-        if (j.status === 'DEAD_LETTER') badge = 'bg-rose-950 text-rose-300 border border-rose-700';
-
-        let action = '';
-        if (j.status === 'DEAD_LETTER') {
-          action = \`<button onclick="retryJob('\${j.id}')" class="bg-rose-600 hover:bg-rose-500 text-white px-2 py-1 rounded text-[10px]">Retry DLQ</button>\`;
+        if (metricsRes.active_workers !== undefined) {
+          document.getElementById('statWorkers').innerText = metricsRes.active_workers;
+          let c = 0, q = 0, r = 0, d = 0;
+          (metricsRes.jobs || []).forEach(item => {
+            if (item.status === 'COMPLETED') c += item.count;
+            if (['QUEUED', 'SCHEDULED'].includes(item.status)) q += item.count;
+            if (['CLAIMED', 'RUNNING'].includes(item.status)) r += item.count;
+            if (item.status === 'DEAD_LETTER') d += item.count;
+          });
+          document.getElementById('statCompleted').innerText = c;
+          document.getElementById('statQueued').innerText = q;
+          document.getElementById('statRunning').innerText = r;
+          document.getElementById('statDLQ').innerText = d;
         }
 
-        return \`
-          <tr>
-            <td class="p-2 text-indigo-400">\${j.id.slice(0,8)}...</td>
-            <td class="p-2 font-sans">\${j.queue_name || 'N/A'}</td>
-            <td class="p-2 text-[10px]">\${j.job_type}</td>
-            <td class="p-2"><span class="px-2 py-0.5 rounded text-[10px] font-semibold \${badge}">\${j.status}</span></td>
-            <td class="p-2">\${j.retry_count}/\${j.max_retries}</td>
-            <td class="p-2 max-w-xs truncate text-slate-400">\${JSON.stringify(j.payload)}</td>
-            <td class="p-2">\${action}</td>
-          </tr>
-        \`;
-      }).join('');
+        const qSel = document.getElementById('queueSelect');
+        if (Array.isArray(queuesRes)) {
+          qSel.innerHTML = '';
+          queuesRes.forEach(queue => {
+            const opt = document.createElement('option');
+            opt.value = queue.id;
+            opt.innerText = queue.name + ' (Max ' + queue.concurrency_limit + ')';
+            qSel.appendChild(opt);
+          });
+        }
+
+        if (Array.isArray(workersRes)) {
+          document.getElementById('workersTable').innerHTML = workersRes.map(w => \`
+            <tr>
+              <td class="p-2 text-indigo-400">\${w.id.slice(0,8)}...</td>
+              <td class="p-2 text-slate-400 font-sans">\${w.hostname}</td>
+              <td class="p-2">\${w.pid}</td>
+              <td class="p-2">\${w.current_load}/\${w.concurrency}</td>
+              <td class="p-2"><span class="px-2 py-0.5 rounded text-[10px] font-bold \${w.live_status === 'ONLINE' ? 'bg-emerald-950 text-emerald-300 border border-emerald-700' : 'bg-rose-950 text-rose-300 border border-rose-700'}">\${w.live_status}</span></td>
+            </tr>
+          \`).join('');
+        }
+
+        if (jobsRes && Array.isArray(jobsRes.data)) {
+          document.getElementById('jobsTable').innerHTML = jobsRes.data.map(j => {
+            let badge = 'bg-slate-800 text-slate-300';
+            if (j.status === 'COMPLETED') badge = 'bg-emerald-950 text-emerald-300 border border-emerald-700';
+            if (['RUNNING', 'CLAIMED'].includes(j.status)) badge = 'bg-amber-950 text-amber-300 border border-amber-700';
+            if (j.status === 'DEAD_LETTER') badge = 'bg-rose-950 text-rose-300 border border-rose-700';
+
+            let action = '';
+            if (j.status === 'DEAD_LETTER') {
+              action = \`<button onclick="retryJob('\${j.id}')" class="bg-rose-600 hover:bg-rose-500 text-white px-2 py-1 rounded text-[10px]">Retry DLQ</button>\`;
+            }
+
+            return \`
+              <tr>
+                <td class="p-2 text-indigo-400">\${j.id.slice(0,8)}...</td>
+                <td class="p-2 font-sans">\${j.queue_name || 'N/A'}</td>
+                <td class="p-2 text-[10px]">\${j.job_type}</td>
+                <td class="p-2"><span class="px-2 py-0.5 rounded text-[10px] font-semibold \${badge}">\${j.status}</span></td>
+                <td class="p-2">\${j.retry_count}/\${j.max_retries}</td>
+                <td class="p-2 max-w-xs truncate text-slate-400">\${JSON.stringify(j.payload)}</td>
+                <td class="p-2">\${action}</td>
+              </tr>
+            \`;
+          }).join('');
+        }
+      } catch (err) {
+        console.warn('Dashboard fetch warning:', err);
+      }
     }
 
     async function submitJob() {
@@ -502,18 +620,17 @@ app.get('/', (_req, res) => {
 
       await fetch('/api/jobs', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: getHeaders(),
         body: JSON.stringify({ queue_id, payload, delay_seconds: delay, priority })
       });
       loadData();
     }
 
     async function retryJob(jobId) {
-      await fetch('/api/dlq/' + jobId + '/retry', { method: 'POST' });
+      await fetch('/api/dlq/' + jobId + '/retry', { method: 'POST', headers: getHeaders() });
       loadData();
     }
 
-    loadData();
     setInterval(loadData, 2000);
   </script>
 </body>
