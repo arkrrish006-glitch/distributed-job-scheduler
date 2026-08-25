@@ -28,7 +28,6 @@ export async function runCronSchedulerIteration() {
          WHERE id = $2`,
         [nextDate, item.id]
       );
-      console.log(`[Cron Scheduler] Dispatched scheduled task "${item.name}", next run at: ${nextDate.toISOString()}`);
     }
     await client.query('COMMIT');
   } catch (err) {
@@ -40,6 +39,5 @@ export async function runCronSchedulerIteration() {
 }
 
 export function startCronService(intervalMs = 5000) {
-  console.log('⏰ [Cron Scheduler Service] Initialized');
   setInterval(runCronSchedulerIteration, intervalMs);
 }

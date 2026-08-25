@@ -4,7 +4,7 @@ import { calculateRetryDelay, recoverStaleJobs } from './src/worker/worker';
 
 async function runComprehensiveTests() {
   console.log('====================================================');
-  console.log('🧪 CODITY DISTRIBUTED SCHEDULER COMPREHENSIVE SUITE');
+  console.log('🧪 CODITY DISTRIBUTED SCHEDULER TEST SUITE');
   console.log('====================================================\n');
 
   try {
@@ -21,7 +21,7 @@ async function runComprehensiveTests() {
     const queueId = qRes.rows[0].id;
     console.log('✅ [TEST 1 PASS]: Isolated Database Environment Initialized');
 
-    // 2. High-Concurrency Claiming: Register 10 Real Workers First to Satisfy Foreign Keys
+    // 2. High-Concurrency Claiming (Register 10 Real Workers & Concurrent Promise.all)
     const workerIds: string[] = [];
     for (let i = 0; i < 10; i++) {
       const wId = uuidv4();
@@ -49,7 +49,6 @@ async function runComprehensiveTests() {
       RETURNING id;
     `;
 
-    // Fire 10 simultaneous worker claim queries concurrently
     const claimPromises = workerIds.map(wId => pool.query(claimQuery, [queueId, wId]));
     const claimResults = await Promise.all(claimPromises);
 
@@ -101,7 +100,7 @@ async function runComprehensiveTests() {
     if (!duplicateRejected) throw new Error('Idempotency violation: duplicate key inserted.');
     console.log('✅ [TEST 4 PASS]: Idempotency Enforced (Unique constraint prevents duplicate jobs).');
 
-    // 5. Retry Calculation Formulas
+    // 5. Backoff Delay Formulas
     const fixedDelay = calculateRetryDelay('FIXED', 2, 5, 300);
     const linearDelay = calculateRetryDelay('LINEAR', 3, 5, 300);
     const expDelay = calculateRetryDelay('EXPONENTIAL', 3, 5, 300);

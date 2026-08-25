@@ -147,7 +147,7 @@ CREATE TABLE IF NOT EXISTS dead_letter_queue (
     original_payload JSONB
 );
 
--- Critical Indexes for Atomic Claiming, Queue Concurrency & Idempotency
+-- Production Indexes
 CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_idempotency ON jobs (queue_id, idempotency_key) WHERE idempotency_key IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_jobs_claim_covering ON jobs (status, scheduled_for, priority DESC, created_at ASC) WHERE status IN ('QUEUED', 'SCHEDULED');
 CREATE INDEX IF NOT EXISTS idx_jobs_queue_active ON jobs (queue_id) WHERE status IN ('CLAIMED', 'RUNNING');

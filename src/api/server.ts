@@ -10,10 +10,9 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Initialize Background Cron Scheduler
 startCronService(5000);
 
-// --- AUTHENTICATION ROUTES ---
+// --- AUTHENTICATION ---
 app.post('/api/auth/register', async (req, res) => {
   const { org_name, email, password } = req.body;
   if (!email || !password || password.length < 6) {
@@ -38,7 +37,7 @@ app.post('/api/auth/register', async (req, res) => {
     res.status(201).json({ user, token });
   } catch (err: any) {
     await client.query('ROLLBACK');
-    res.status(409).json({ error: { code: 'USER_EXISTS', message: 'User already exists or invalid data.' } });
+    res.status(409).json({ error: { code: 'USER_EXISTS', message: 'User already exists.' } });
   } finally {
     client.release();
   }
@@ -64,7 +63,11 @@ app.post('/api/auth/login', async (req, res) => {
   }
 });
 
-// --- PROJECT MANAGEMENT ROUTES ---
+app.get('/api/auth/me', requireAuth, (req: AuthRequest, res: Response) => {
+  res.json({ user: req.user });
+});
+
+// --- PROJECTS ---
 app.post('/api/projects', requireAuth, async (req: AuthRequest, res: Response) => {
   const { name } = req.body;
   if (!name) return res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: 'Project name required.' } });
@@ -89,7 +92,7 @@ app.get('/api/projects', requireAuth, async (req: AuthRequest, res: Response) =>
   }
 });
 
-// --- QUEUE MANAGEMENT ROUTES ---
+// --- QUEUES ---
 app.get('/api/queues', async (_req, res) => {
   try {
     const result = await pool.query(`SELECT q.*, rp.name as retry_policy_name FROM queues q LEFT JOIN retry_policies rp ON q.retry_policy_id = rp.id ORDER BY q.created_at DESC`);
@@ -101,7 +104,7 @@ app.get('/api/queues', async (_req, res) => {
 
 app.post('/api/queues', async (req, res) => {
   const { project_id, name, priority, concurrency_limit, retry_policy_id } = req.body;
-  if (!project_id || !name) return res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: 'project_id and name are required.' } });
+  if (!project_id || !name) return res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: 'project_id and name required.' } });
   try {
     const result = await pool.query(
       `INSERT INTO queues (project_id, name, priority, concurrency_limit, retry_policy_id)
@@ -132,28 +135,36 @@ app.patch('/api/queues/:id', async (req, res) => {
   }
 });
 
-// --- JOB SUBMISSION (Immediate, Delayed, Idempotent) ---
+app.get('/api/queues/:id/stats', async (req, res) => {
+  try {
+    const stats = await pool.query(
+      `SELECT status, COUNT(*)::int as count 
+       FROM jobs WHERE queue_id = $1 GROUP BY status`,
+      [req.params.id]
+    );
+    const dlq = await pool.query(`SELECT COUNT(*)::int as dlq_count FROM dead_letter_queue WHERE queue_id = $1`, [req.params.id]);
+    res.json({ queue_id: req.params.id, stats: stats.rows, dlq: dlq.rows[0]?.dlq_count || 0 });
+  } catch (err: any) {
+    res.status(500).json({ error: { code: 'SERVER_ERROR', message: err.message } });
+  }
+});
+
+// --- JOBS (IMMEDIATE, DELAYED, BATCH, IDEMPOTENT) ---
 app.post('/api/jobs', async (req, res) => {
   const { queue_id, job_type, payload, priority, delay_seconds, max_retries } = req.body;
   const idempotencyKey = req.headers['idempotency-key'] as string;
 
   if (!queue_id || !payload) {
-    return res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: 'queue_id and payload are required.' } });
+    return res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: 'queue_id and payload required.' } });
   }
 
   try {
-    // Idempotency check
     if (idempotencyKey) {
       const existing = await pool.query(`SELECT * FROM jobs WHERE queue_id = $1 AND idempotency_key = $2`, [queue_id, idempotencyKey]);
-      if (existing.rows.length > 0) {
-        return res.status(200).json(existing.rows[0]);
-      }
+      if (existing.rows.length > 0) return res.status(200).json(existing.rows[0]);
     }
 
-    const scheduledFor = delay_seconds && delay_seconds > 0
-      ? new Date(Date.now() + delay_seconds * 1000)
-      : new Date();
-
+    const scheduledFor = delay_seconds && delay_seconds > 0 ? new Date(Date.now() + delay_seconds * 1000) : new Date();
     const determinedType = delay_seconds && delay_seconds > 0 ? 'DELAYED' : (job_type || 'IMMEDIATE');
     const initialStatus = delay_seconds && delay_seconds > 0 ? 'SCHEDULED' : 'QUEUED';
 
@@ -169,11 +180,10 @@ app.post('/api/jobs', async (req, res) => {
   }
 });
 
-// --- BATCH JOB SUBMISSION ---
 app.post('/api/jobs/batch', async (req, res) => {
   const { queue_id, jobs } = req.body;
   if (!queue_id || !Array.isArray(jobs) || jobs.length === 0) {
-    return res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: 'queue_id and a non-empty jobs array are required.' } });
+    return res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: 'queue_id and jobs array required.' } });
   }
 
   const client = await pool.connect();
@@ -198,11 +208,11 @@ app.post('/api/jobs/batch', async (req, res) => {
   }
 });
 
-// --- RECURRING CRON CREATION ---
+// --- SCHEDULED RECURRING CRON ---
 app.post('/api/scheduled-jobs', async (req, res) => {
   const { queue_id, name, cron_expression, payload } = req.body;
   if (!queue_id || !cron_expression || !name) {
-    return res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: 'queue_id, name, and cron_expression are required.' } });
+    return res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: 'queue_id, name, and cron_expression required.' } });
   }
 
   try {
@@ -220,7 +230,7 @@ app.post('/api/scheduled-jobs', async (req, res) => {
   }
 });
 
-// --- JOB PAGINATION & FILTERING ---
+// --- PAGINATION & FILTERING ---
 app.get('/api/jobs', async (req, res) => {
   const page = parseInt(req.query.page as string) || 1;
   const limit = Math.min(100, parseInt(req.query.limit as string) || 20);
@@ -262,19 +272,13 @@ app.get('/api/jobs', async (req, res) => {
 
     res.json({
       data: dataRes.rows,
-      pagination: {
-        page,
-        limit,
-        total,
-        total_pages: Math.ceil(total / limit)
-      }
+      pagination: { page, limit, total, total_pages: Math.ceil(total / limit) }
     });
   } catch (err: any) {
     res.status(500).json({ error: { code: 'QUERY_FAILED', message: err.message } });
   }
 });
 
-// --- WORKER & SYSTEM METRICS ---
 app.get('/api/workers', async (_req, res) => {
   try {
     const result = await pool.query(
@@ -333,7 +337,7 @@ app.post('/api/dlq/:job_id/retry', async (req, res) => {
   }
 });
 
-// --- INTERACTIVE EMBEDDED DASHBOARD ---
+// --- EMBEDDED REAL-TIME WEB DASHBOARD ---
 app.get('/', (_req, res) => {
   res.send(`
 <!DOCTYPE html>
@@ -358,7 +362,7 @@ app.get('/', (_req, res) => {
     </div>
 
     <!-- Metrics -->
-    <div class="grid grid-cols-2 md:grid-cols-5 gap-3" id="metricsGrid">
+    <div class="grid grid-cols-2 md:grid-cols-5 gap-3">
       <div class="bg-slate-900 p-4 rounded border border-slate-800"><p class="text-[10px] uppercase text-slate-400">Active Workers</p><p id="statWorkers" class="text-2xl font-bold mt-1 text-white">0</p></div>
       <div class="bg-slate-900 p-4 rounded border border-slate-800"><p class="text-[10px] uppercase text-slate-400">Queued / Scheduled</p><p id="statQueued" class="text-2xl font-bold mt-1 text-amber-400">0</p></div>
       <div class="bg-slate-900 p-4 rounded border border-slate-800"><p class="text-[10px] uppercase text-slate-400">Running / Claimed</p><p id="statRunning" class="text-2xl font-bold mt-1 text-indigo-400">0</p></div>
@@ -422,7 +426,7 @@ app.get('/', (_req, res) => {
   <script>
     async function loadData() {
       const statusFilter = document.getElementById('filterStatus').value;
-      const statusQuery = statusFilter ? \`&status=\${statusFilter}\` : '';
+      const statusQuery = statusFilter ? '&status=' + statusFilter : '';
       const [metricsRes, queuesRes, workersRes, jobsRes] = await Promise.all([
         fetch('/api/metrics').then(r => r.json()),
         fetch('/api/queues').then(r => r.json()),
@@ -448,7 +452,7 @@ app.get('/', (_req, res) => {
         queuesRes.forEach(queue => {
           const opt = document.createElement('option');
           opt.value = queue.id;
-          opt.innerText = \`\${queue.name} (Max \${queue.concurrency_limit})\`;
+          opt.innerText = queue.name + ' (Max ' + queue.concurrency_limit + ')';
           qSel.appendChild(opt);
         });
       }
@@ -463,7 +467,7 @@ app.get('/', (_req, res) => {
         </tr>
       \`).join('');
 
-      document.getElementById('jobsTable').innerHTML = jobsRes.data.map(j => {
+      document.getElementById('jobsTable').innerHTML = (jobsRes.data || []).map(j => {
         let badge = 'bg-slate-800 text-slate-300';
         if (j.status === 'COMPLETED') badge = 'bg-emerald-950 text-emerald-300 border border-emerald-700';
         if (['RUNNING', 'CLAIMED'].includes(j.status)) badge = 'bg-amber-950 text-amber-300 border border-amber-700';
@@ -505,7 +509,7 @@ app.get('/', (_req, res) => {
     }
 
     async function retryJob(jobId) {
-      await fetch(\`/api/dlq/\${jobId}/retry\`, { method: 'POST' });
+      await fetch('/api/dlq/' + jobId + '/retry', { method: 'POST' });
       loadData();
     }
 

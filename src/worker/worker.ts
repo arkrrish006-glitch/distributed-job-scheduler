@@ -35,7 +35,6 @@ export async function registerWorker() {
     }
   }, 5000);
 
-  // Crash Recovery Reaper (Runs every 10 seconds)
   reaperTimer = setInterval(recoverStaleJobs, 10000);
 }
 
@@ -48,7 +47,7 @@ export async function recoverStaleJobs() {
     );
 
     if (staleWorkers.rows.length > 0) {
-      const staleIds = staleWorkers.rows.map(w => w.id);
+      const staleIds = staleWorkers.rows.map((w: any) => w.id);
       const recovered = await pool.query(
         `UPDATE jobs
          SET status = 'QUEUED', claimed_by = NULL, updated_at = NOW()
@@ -75,7 +74,6 @@ export async function recoverStaleJobs() {
 export async function claimNextJob(batchSize: number = 1) {
   if (isShuttingDown || batchSize <= 0) return [];
 
-  // Atomic Job Claiming with Enforced Queue Concurrency Limits & Queue Pause Check
   const query = `
     WITH active_per_queue AS (
       SELECT queue_id, COUNT(*)::int AS running_count
@@ -118,7 +116,6 @@ export function calculateRetryDelay(strategy: string, attempt: number, baseDelay
   } else if (strategy === 'EXPONENTIAL') {
     delay = baseDelay * Math.pow(2, attempt);
   }
-  // Add 10% jitter to eliminate thundering herd
   const jitter = delay * (Math.random() * 0.1);
   return Math.min(maxDelay, Math.round(delay + jitter));
 }
@@ -147,13 +144,11 @@ export async function processJob(job: any) {
     );
     await client.query('COMMIT');
 
-    // Job Execution Simulation / Dispatch
     if (job.payload && job.payload.simulate_fail) {
       throw new Error(job.payload.error_reason || 'Simulated runtime exception');
     }
-    await new Promise((resolve) => setTimeout(resolve, 600));
+    await new Promise((resolve) => setTimeout(resolve, 500));
 
-    // Execution Success
     const executionDuration = Date.now() - startTime;
     await client.query('BEGIN');
     await client.query(
@@ -178,7 +173,6 @@ export async function processJob(job: any) {
     const nextAttempt = job.retry_count + 1;
     const maxRetries = job.max_retries || 3;
 
-    // Fetch queue retry policy
     const policyRes = await pool.query(
       `SELECT rp.* FROM queues q
        LEFT JOIN retry_policies rp ON q.retry_policy_id = rp.id
@@ -188,7 +182,6 @@ export async function processJob(job: any) {
     const policy = policyRes.rows[0] || { strategy: 'EXPONENTIAL', base_delay_seconds: 5, max_delay_seconds: 300 };
 
     if (nextAttempt >= maxRetries) {
-      // Move to Dead Letter Queue (DLQ)
       await client.query('BEGIN');
       await client.query(`UPDATE jobs SET status = 'DEAD_LETTER', updated_at = NOW() WHERE id = $1`, [job.id]);
       await client.query(
@@ -204,11 +197,10 @@ export async function processJob(job: any) {
       await client.query(
         `INSERT INTO job_logs (job_id, level, message)
          VALUES ($1, 'ERROR', $2)`,
-        [job.id, `Max retries reached (${maxRetries}). Moved to Dead Letter Queue.`]
+        [job.id, `Max retries reached (${maxRetries}). Moved to DLQ.`]
       );
       await client.query('COMMIT');
     } else {
-      // Re-schedule with backoff
       const delay = calculateRetryDelay(policy.strategy, nextAttempt, policy.base_delay_seconds, policy.max_delay_seconds);
       await client.query('BEGIN');
       await client.query(
@@ -250,23 +242,21 @@ export async function startWorker() {
         activePromises.add(jobPromise);
       }
     }
-    await new Promise((r) => setTimeout(r, 800));
+    await new Promise((r) => setTimeout(r, 600));
   }
 
-  // Graceful Shutdown Drain
   console.log(`🛑 [Worker Engine] Draining ${activePromises.size} active jobs...`);
   await Promise.all(Array.from(activePromises));
   await pool.query(`UPDATE workers SET status = 'OFFLINE', last_heartbeat = NOW() WHERE id = $1`, [WORKER_ID]);
   if (heartbeatTimer) clearInterval(heartbeatTimer);
   if (reaperTimer) clearInterval(reaperTimer);
-  console.log(`👋 [Worker Engine] Clean shutdown finished.`);
+  console.log(`👋 [Worker Engine] Clean shutdown complete.`);
 }
 
-// Intercept System Signals for Graceful Shutdown
 ['SIGINT', 'SIGTERM'].forEach((signal) => {
   process.on(signal, async () => {
     if (isShuttingDown) return;
-    console.log(`\n⚠️ Received ${signal}. Initiating graceful shutdown sequence...`);
+    console.log(`\n⚠️ Received ${signal}. Draining worker gracefully...`);
     isShuttingDown = true;
   });
 });
